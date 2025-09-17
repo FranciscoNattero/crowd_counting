@@ -1,0 +1,3 @@
+medium: https://github.com/Abcfsa/YOLOv8_head_detector/blob/main/medium.pt
+owen: https://github.com/Owen718/Head-Detection-Yolov8
+finetuned: Finetuning de yolov11 con VisDrone
