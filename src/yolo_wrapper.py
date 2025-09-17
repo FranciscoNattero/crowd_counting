@@ -1,21 +1,25 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
-from collections import Counter
+from collections import Counter, deque
 import supervision as sv
 import os
 import torch
-from collections import deque
+from torchvision.ops import box_iou
 
 class YoloWrapper:
     def __init__(self, config):
         self.config = config
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.config.device)
-        torch.cuda.set_device(0)
+
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
         self.model = YOLO(config.model_path)
         self.model.to(0)
+
         self.prev_state = {} #Para cada trackid (box detectada) guardo sus ultimos dos estados en una queue
         self.tracker = sv.ByteTrack(config.track_thresh, config.match_thresh, config.track_buffer)
 
@@ -40,52 +44,76 @@ class YoloWrapper:
 
         writer = None
         total_frames = 0
+        self.model.model.float()
+        stream = self.model.predict(
+                source=str(src_path),
+                classes=self.config.classes,
+                conf=conf,
+                iou=iou,
+                stream=True,
+                device=self.config.device,
+                workers=self.config.workers,
+                vid_stride=self.config.vid_stride,
+                imgsz=self.config.imgsz,
+                half=torch.cuda.is_available()
+            )
 
-        for res in self.model.predict(source=str(src_path), classes=self.config.classes, conf=conf, iou=iou, stream=True, device=self.config.device, workers=self.config.workers, vid_stride=self.config.vid_stride):
 
-            merged_xyxy, merged_cls, merged_conf, merge_box_amount = self.__merge_overlapping_boxes_by_class(
-                res.boxes.xyxy.cpu().numpy(),
-                res.boxes.cls.cpu().numpy(),
-                res.boxes.conf.cpu().numpy(),
-                res.names)
+        for res in stream:
+            frame_bgr = np.ascontiguousarray(res.orig_img.copy())
+            boxes = res.boxes
+            xyxy = boxes.xyxy.cpu().numpy()
+            cls = boxes.cls.cpu().numpy().astype(np.int32)
+            confs = boxes.conf.cpu().numpy().astype(np.float32)
+
+            merged_xyxy, merged_cls, merged_conf, merged_amount = self.__merge_overlapping_boxes_by_class(
+                xyxy, cls, confs, res.names
+            )
             
             detections = sv.Detections(xyxy=merged_xyxy, class_id=merged_cls, confidence=merged_conf)
+            detections.data["merge_box_amount"] = merged_amount
 
             track = self.tracker.update_with_detections(detections)
 
             if track.xyxy.shape[0] == 0:
-                frame_bgr = self._plot_yolo_boxes(res, merged_xyxy, merged_cls, merged_conf, merge_box_amount)
+                frame_bgr = self._plot_yolo_boxes(res, merged_xyxy, merged_cls, merged_conf, merged_amount, res.names)
+                self.prev_state.clear()
             
             else:
                 ids   = track.tracker_id.astype(int)
                 boxes = track.xyxy.astype(np.float32)
                 classes = track.class_id.astype(int)
                 confs   = track.confidence.astype(np.float32)
-
+                tracked_amount = track.data.get(
+                        "merge_box_amount",
+                        np.ones(len(boxes), dtype=np.int32)
+                    )
+                
                 clamped = boxes.copy()
 
                 #para cada tracked id le hago un clamp transition, esto regula cuanto se puede agrandar y cuanto se puede mover la bounding box haciendo clip
                 for i, tid in enumerate(ids):
-                    history = self.prev_state.setdefault(tid, deque(maxlen=2))
+                    history = self.prev_state.setdefault(tid, deque(maxlen=10))
                     clamped[i] = self._clamp_transition(history, boxes[i])
                     history.append(boxes[i])
 
+                active_ids = set(ids.tolist())
+                self.prev_state = {tid: hist for tid, hist in self.prev_state.items() if tid in active_ids}
 
-                frame_bgr = self._plot_yolo_boxes(res, clamped, classes, confs, merge_box_amount)
+                frame_bgr = self._plot_yolo_boxes(
+                        frame_bgr, clamped, classes, confs, tracked_amount, res.names
+                    )
 
             if writer is None:
                 h, w = frame_bgr.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h), True)
 
-            count = self._count_people(res)
-            self._draw_overlay(frame_bgr, f"Cantidad de Personas: {count}")
+            # count = self._count_people(merged_cls, res.names)
+            # self._draw_overlay(frame_bgr, f"Cantidad de Personas: {count}")
 
             if display:
                 cv2.imshow("detección en tiempo real", frame_bgr)
-                key = cv2.waitKey(max(1, int(1000/fps)))
-                if key in (ord("q"), 27):
-                    break
 
             writer.write(frame_bgr)
             total_frames += 1
@@ -105,16 +133,12 @@ class YoloWrapper:
         cv2.putText(img_bgr, text, (x0 + pad, y1 - pad),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
         
-    def _count_people(self, res):
-        classes = res.boxes.cls.cpu().numpy().astype(int)
-        names = res.names
+    def _count_people(self, classes, class_names):
         # print(names)
-        return int(sum(1 for c in classes if names.get(int(c), "") in ["pedestrian", "people"]))
+        return int(sum(1 for c in classes if class_names.get(int(c), "") in ["pedestrian", "people"]))
     
-    def _plot_yolo_boxes(self, res, xyxy, cls, conf, merge_box_amount):
-        #el default seria hacer res.plot() pero ahi no podemos mergear boxes
-        annotated = self._draw_boxes_with_custom_legend(res.orig_img, xyxy, cls, conf, res.names, merge_box_amount)
-        return cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+    def _plot_yolo_boxes(self, frame_bgr, xyxy, cls, conf, merge_box_amount, class_names):
+        return self._draw_boxes_with_custom_legend(frame_bgr, xyxy, cls, conf, class_names, merge_box_amount)
 
     def _boxes_iou(self, a, b):
         xa1, ya1, xa2, ya2 = a
@@ -140,18 +164,15 @@ class YoloWrapper:
         return np.array([cx-0.5*w, cy-0.5*h, cx+0.5*w, cy+0.5*h], np.float32) #te devuelve x1, y1, x2, y2
 
     def _clamp_transition(self, past_states, curr_state):
-        buckets = []
+        if not past_states:
+            return curr_state
 
-        if len(past_states) == 2:
-            buckets.extend(past_states)
-        else:
-            buckets.extend(list(past_states))
-        
-        buckets.append(curr_state)
+        history = list(past_states)
+        history.append(curr_state)
 
-        cxcywh = [self._to_cxcywh(box) for box in buckets]
-        avg = np.mean(cxcywh, axis=0, dtype=np.float32)
-        
+        cxcywh = np.stack([self._to_cxcywh(box) for box in history], axis=0)
+        avg = cxcywh.mean(axis=0).astype(np.float32)
+
         return self._to_xyxy(avg)
 
 
@@ -165,43 +186,35 @@ class YoloWrapper:
         merged_confs = []
         merge_box_amount = []
 
-        for c in np.unique(cls):
-            idx = np.where(cls == c)[0]
+        for class_id in np.unique(cls):
+            idx = np.where(cls == class_id)[0]
             if idx.size == 0:
                 continue
 
-            class_label = class_names.get(int(c), "")
-
+            class_label = class_names.get(int(class_id), "")
 
             boxes_c = xyxy[idx]
             conf_c = conf[idx]
-            classes_c = cls[idx]
 
             if class_label != "pedestrian":
                 merged_boxes.extend(boxes_c.tolist())
-                merged_classes.extend(classes_c.tolist())
+                merged_classes.extend(cls[idx].tolist())
                 merged_confs.extend(conf_c.tolist())
+                merge_box_amount.extend([1] * len(idx))
                 continue
 
             n = boxes_c.shape[0]
-            adj = [[] for _ in range(n)]
-            for i in range(n):
-                for j in range(i + 1, n):
-                    #TOda box j que tiene iou mayor al threshold con la box i pasa a ser un vecino en el grafo
-                    expand_box = np.array([-50, -50, 50, 50])
-                    box_i = boxes_c[i]
-                    box_i += expand_box
 
-                    box_j = boxes_c[j]
-                    box_j += expand_box
-                    if self._boxes_iou(box_i, box_j) >= self.config.merge_iou_threshold:
-                        adj[i].append(j)
-                        adj[j].append(i)
+            if n == 0:
+                continue
 
-                    box_i -= expand_box
-                    box_j -= expand_box
+            expand_pad = torch.tensor([-30, -30, 30, 30], dtype=torch.float32)
+            boxes_tensor = torch.from_numpy(boxes_c)
+            adjacency = (box_iou(boxes_tensor + expand_pad, boxes_tensor + expand_pad)
+                         >= self.config.merge_iou_threshold[0]).numpy()
 
-            #Nodo por nodo recorro sus vecinos y los mergeo con el nodo actual.
+
+            #Nodo por nodo recorro sus vecinos y los mergeo con el nodo actual. Hago bfs
             visited = np.zeros(n, dtype=bool)
             for i in range(n):
                 if visited[i]:
@@ -212,29 +225,30 @@ class YoloWrapper:
                 while stack:
                     u = stack.pop()
                     comp.append(u)
-                    for v in adj[u]:
+                    neighbours = np.where(adjacency[u])[0]
+                    for v in neighbours:
                         if not visited[v]:
                             visited[v] = True
                             stack.append(v)
-                comp = np.array(comp, dtype=int)
+
                 group_boxes = boxes_c[comp]
                 group_conf = conf_c[comp]
+                merged_boxes.append([
+                    float(group_boxes[:, 0].min()),
+                    float(group_boxes[:, 1].min()),
+                    float(group_boxes[:, 2].max()),
+                    float(group_boxes[:, 3].max())
+                ])
+                merged_classes.append(int(class_id))
+                merged_confs.append(float(group_conf.max()))
+                merge_box_amount.append(len(comp))
 
-                x1 = float(group_boxes[:,0].min())
-                y1 = float(group_boxes[:,1].min())
-                x2 = float(group_boxes[:,2].max())
-                y2 = float(group_boxes[:,3].max())
-                mconf = float(group_conf.max())
-
-                merged_boxes.append([x1, y1, x2, y2])
-                merged_classes.append(int(c))
-                merged_confs.append(mconf)
-                merge_box_amount.append(group_boxes.shape[0])
-
-        return (np.array(merged_boxes, dtype=np.float32),
-                np.array(merged_classes, dtype=int),
-                np.array(merged_confs, dtype=np.float32),
-                np.array(merge_box_amount))
+        return (
+            np.asarray(merged_boxes, dtype=np.float32).reshape(-1, 4),
+            np.asarray(merged_classes, dtype=np.int32),
+            np.asarray(merged_confs, dtype=np.float32),
+            np.asarray(merge_box_amount, dtype=np.int32)
+        )
 
     def _color_for_class(self, c):
         rng = np.random.RandomState(c * 9973 + 12345)
@@ -251,8 +265,8 @@ class YoloWrapper:
             font_scale=0.5
         ):
 
-        legend_title="Detections (merged)"
-        out = img_bgr.copy()
+        legend_title="Detections"
+        out = img_bgr
 
         for (x1, y1, x2, y2), c, cf, merge_amount in zip(boxes, classes, confs, merge_box_amount):
             c = int(c)
@@ -260,7 +274,7 @@ class YoloWrapper:
             cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)), col, thickness)
             # label = f"{class_names[c]} {cf:.2f}"
             if class_names[c] == "pedestrian":
-                label = f"Peaceful crowd of {merge_amount}"
+                label = f"Quiet crowd of {merge_amount}"
             else:
                 label = f"{class_names[c]}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
@@ -279,9 +293,8 @@ class YoloWrapper:
 
         if legend_title or legend_lines:
             max_text_w = 0
-            tmp_img = np.zeros((1,1,3), dtype=np.uint8)
             for txt in [legend_title] + [t for _, t in legend_lines]:
-                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
                 max_text_w = max(max_text_w, tw)
             box_w = max_text_w + 3*pad + 16
             box_h = pad + line_h + len(legend_lines)*line_h + pad

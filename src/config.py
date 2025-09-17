@@ -3,15 +3,15 @@ class Config:
     model_path = "src/models/finetuned.pt"
     conf = 0.2
     iou = 0.45
-    imgsz = 640
+    imgsz = 1920
     device = 1
     classes = range(9),
-    merge_iou_threshold = 0.25,
+    merge_iou_threshold = 0.3,
     box_max_shift = 30 #Cuanto puede moverse una box entre frame y frame
     box_max_scale = 0.08 #Cuanto puede agrandarse una box entre frame y frame
     track_thresh = 0.2 #threshold de confidence
     match_thresh = 0.9 #threshold de iou entre tracks para que sean el mismo
     track_buffer = 5 # dejamos los tracks perdidos por esta cantidad de frames
-    workers = 10
+    workers = 50
     vid_stride=1
     
