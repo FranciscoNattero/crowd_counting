@@ -5,6 +5,7 @@ from collections import Counter
 import supervision as sv
 import os
 import torch
+from collections import deque
 
 class YoloWrapper:
     def __init__(self, config):
@@ -15,7 +16,7 @@ class YoloWrapper:
 
         self.model = YOLO(config.model_path)
         self.model.to(0)
-        self.prev_state = {} #Aca voy a guardar el xyxy, cls y conf del ultimo state computado
+        self.prev_state = {} #Para cada trackid (box detectada) guardo sus ultimos dos estados en una queue
         self.tracker = sv.ByteTrack(config.track_thresh, config.match_thresh, config.track_buffer)
 
     def predict_image(self, src_path, out_path="annotated_image.jpg",):
@@ -30,7 +31,7 @@ class YoloWrapper:
         cv2.imwrite(out_path, img_bgr)
         return out_path, count
 
-    def predict_video(self, src_path, out_path="annotated_video.mp4"):
+    def predict_video(self, src_path, out_path="annotated_video.mp4", display=False):
         conf, iou = self.config.conf, self.config.iou
 
         cap = cv2.VideoCapture(str(src_path))
@@ -61,10 +62,10 @@ class YoloWrapper:
 
                 #para cada tracked id le hago un clamp transition, esto regula cuanto se puede agrandar y cuanto se puede mover la bounding box haciendo clip
                 for i, tid in enumerate(ids):
-                    if tid in self.prev_state:
-                        clamped[i] = self._clamp_transition(self.prev_state[tid], boxes[i])
+                    history = self.prev_state.setdefault(tid, deque(maxlen=2))
+                    clamped[i] = self._clamp_transition(history, boxes[i])
+                    history.append(boxes[i])
 
-                    self.prev_state[tid] = clamped[i]
 
                 frame_bgr = self._plot_yolo_boxes(res, clamped, classes, confs)
 
@@ -75,6 +76,13 @@ class YoloWrapper:
 
             count = self._count_people(res)
             self._draw_overlay(frame_bgr, f"Cantidad de Personas: {count}")
+
+            if display:
+                cv2.imshow("detección en tiempo real", frame_bgr)
+                key = cv2.waitKey(max(1, int(1000/fps)))
+                if key in (ord("q"), 27):
+                    break
+
             writer.write(frame_bgr)
             total_frames += 1
 
@@ -127,16 +135,21 @@ class YoloWrapper:
         cx,cy,w,h = s
         return np.array([cx-0.5*w, cy-0.5*h, cx+0.5*w, cy+0.5*h], np.float32) #te devuelve x1, y1, x2, y2
 
-    def _clamp_transition(self, prev, curr):
-        max_shift, max_scale = self.config.box_max_shift, self.config.box_max_scale
-        p = self._to_cxcywh(prev); c = self._to_cxcywh(curr)
+    def _clamp_transition(self, past_states, curr_state):
+        buckets = []
 
-        dx = np.clip(c[0]-p[0], -max_shift, max_shift)
-        dy = np.clip(c[1]-p[1], -max_shift, max_shift)
+        if len(past_states) == 2:
+            buckets.extend(past_states)
+        else:
+            buckets.extend(list(past_states))
+        
+        buckets.append(curr_state)
 
-        w = np.clip(c[2], p[2]*(1-max_scale), p[2]*(1+max_scale))
-        h = np.clip(c[3], p[3]*(1-max_scale), p[3]*(1+max_scale))
-        return self._to_xyxy(np.array([p[0]+dx, p[1]+dy, w, h], np.float32))
+        cxcywh = [self._to_cxcywh(box) for box in buckets]
+        avg = np.mean(cxcywh, axis=0, dtype=np.float32)
+        
+        return self._to_xyxy(avg)
+
 
     def __merge_overlapping_boxes_by_class(self, xyxy, cls, conf):
         xyxy = np.asarray(xyxy, dtype=np.float32) # (N, 4), para cada box detectada tiene x1, y1, x2, y2

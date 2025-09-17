@@ -13,5 +13,5 @@ class Config:
     match_thresh = 0.9 #threshold de iou entre tracks para que sean el mismo
     track_buffer = 5 # dejamos los tracks perdidos por esta cantidad de frames
     workers = 4
-    vid_stride=2
+    vid_stride=1
     
