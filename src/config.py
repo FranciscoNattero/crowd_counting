@@ -1,7 +1,7 @@
 
 class Config:
     model_path = "src/models/finetuned.pt"
-    conf = 0.1
+    conf = 0.2
     iou = 0.45
     imgsz = 640
     device = 1
@@ -12,6 +12,6 @@ class Config:
     track_thresh = 0.2 #threshold de confidence
     match_thresh = 0.9 #threshold de iou entre tracks para que sean el mismo
     track_buffer = 5 # dejamos los tracks perdidos por esta cantidad de frames
-    workers = 4
+    workers = 10
     vid_stride=1
     
