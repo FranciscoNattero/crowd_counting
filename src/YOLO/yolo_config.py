@@ -1,12 +1,13 @@
 
-class Config:
-    model_path = "src/models/finetuned.pt"
-    conf = 0.2
+class YoloConfig:
+    model_path = "src/models/finetuned_yolom.pt"
+    # model_path = "runs/detect/train4/weights/best.pt"
+    conf = 0.1
     iou = 0.45
-    imgsz = 1920
+    imgsz = 1280
     device = 1
     classes = range(9),
-    merge_iou_threshold = 0.3,
+    merge_iou_threshold = 0.2,
     box_max_shift = 30 #Cuanto puede moverse una box entre frame y frame
     box_max_scale = 0.08 #Cuanto puede agrandarse una box entre frame y frame
     track_thresh = 0.2 #threshold de confidence

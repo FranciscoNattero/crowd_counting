@@ -1,4 +1,4 @@
-from ultralytics import YOLO
+from ultralytics import YOLO, RTDETR
 import cv2
 import numpy as np
 from collections import Counter, deque
@@ -6,6 +6,8 @@ import supervision as sv
 import os
 import torch
 from torchvision.ops import box_iou
+from P2PNet.P2PNet_wrapper import P2PNetWrapper
+from P2PNet.P2PNet_config import P2PNetConfig
 
 class YoloWrapper:
     def __init__(self, config):
@@ -18,10 +20,13 @@ class YoloWrapper:
         torch.set_float32_matmul_precision("high")
 
         self.model = YOLO(config.model_path)
+        # self.model = RTDETR(config.model_path)
         self.model.to(0)
 
         self.prev_state = {} #Para cada trackid (box detectada) guardo sus ultimos dos estados en una queue
         self.tracker = sv.ByteTrack(config.track_thresh, config.match_thresh, config.track_buffer)
+
+        self.crowd_estimator = P2PNetWrapper( P2PNetConfig() )
 
     def predict_image(self, src_path, out_path="annotated_image.jpg",):
         conf, iou = self.config.conf, self.config.iou
@@ -77,8 +82,9 @@ class YoloWrapper:
 
             if track.xyxy.shape[0] == 0:
                 frame_bgr = self._plot_yolo_boxes(res, merged_xyxy, merged_cls, merged_conf, merged_amount, res.names)
+                frame_bgr, _counts = self._refine_crowd_with_p2p(frame_bgr, merged_xyxy, merged_cls, res.names)
                 self.prev_state.clear()
-            
+
             else:
                 ids   = track.tracker_id.astype(int)
                 boxes = track.xyxy.astype(np.float32)
@@ -88,17 +94,23 @@ class YoloWrapper:
                         "merge_box_amount",
                         np.ones(len(boxes), dtype=np.int32)
                     )
-                
+
                 clamped = boxes.copy()
+
+                pedestrian_mask = np.array([res.names[int(c)] == "pedestrian" for c in classes], dtype=bool)
 
                 #para cada tracked id le hago un clamp transition, esto regula cuanto se puede agrandar y cuanto se puede mover la bounding box haciendo clip
                 for i, tid in enumerate(ids):
-                    history = self.prev_state.setdefault(tid, deque(maxlen=10))
+                    if not pedestrian_mask[i]:
+                        continue #solo promedio las merged boxes de pedestrians
+                    history = self.prev_state.setdefault(tid, {"boxes_queue": deque(maxlen=20)})
                     clamped[i] = self._clamp_transition(history, boxes[i])
-                    history.append(boxes[i])
+                    history["boxes_queue"].append(boxes[i])
 
                 active_ids = set(ids.tolist())
                 self.prev_state = {tid: hist for tid, hist in self.prev_state.items() if tid in active_ids}
+
+                frame_bgr, _counts = self._refine_crowd_with_p2p(frame_bgr, clamped, classes, res.names)
 
                 frame_bgr = self._plot_yolo_boxes(
                         frame_bgr, clamped, classes, confs, tracked_amount, res.names
@@ -208,7 +220,7 @@ class YoloWrapper:
             if n == 0:
                 continue
 
-            expand_pad = torch.tensor([-30, -30, 30, 30], dtype=torch.float32)
+            expand_pad = torch.tensor([-100, -100, 100, 100], dtype=torch.float32)
             boxes_tensor = torch.from_numpy(boxes_c)
             adjacency = (box_iou(boxes_tensor + expand_pad, boxes_tensor + expand_pad)
                          >= self.config.merge_iou_threshold[0]).numpy()
@@ -233,12 +245,14 @@ class YoloWrapper:
 
                 group_boxes = boxes_c[comp]
                 group_conf = conf_c[comp]
-                merged_boxes.append([
-                    float(group_boxes[:, 0].min()),
-                    float(group_boxes[:, 1].min()),
-                    float(group_boxes[:, 2].max()),
-                    float(group_boxes[:, 3].max())
-                ])
+                # merged_boxes.append([
+                #     float(group_boxes[:, 0].min()),
+                #     float(group_boxes[:, 1].min()),
+                #     float(group_boxes[:, 2].max()),
+                #     float(group_boxes[:, 3].max())
+                # ])
+                merged_box = self._merge_group_boxes(group_boxes)
+                merged_boxes.append(merged_box.tolist())
                 merged_classes.append(int(class_id))
                 merged_confs.append(float(group_conf.max()))
                 merge_box_amount.append(len(comp))
@@ -250,9 +264,32 @@ class YoloWrapper:
             np.asarray(merge_box_amount, dtype=np.int32)
         )
 
+    def _merge_group_boxes(self, group_boxes, keep_frac=0.6):
+        #Me quedo con el 60% de las boxes mas cercanas a la mediana de centroides, reduzco el jitter.
+        boxes = np.asarray(group_boxes, dtype=np.float32)
+        n = boxes.shape[0]
+
+        cx = 0.5 * (boxes[:, 0] + boxes[:, 2])
+        cy = 0.5 * (boxes[:, 1] + boxes[:, 3])
+
+        med_cx, med_cy = np.mean(cx), np.mean(cy)
+
+        d = np.abs(cx - med_cx) + np.abs(cy - med_cy) #uso distancia l1
+        k = int(np.ceil(keep_frac * n))
+        keep_idx = np.argsort(d)[:k]
+        core = boxes[keep_idx]
+
+        x1 = float(np.min(core[:, 0]))
+        y1 = float(np.min(core[:, 1]))
+        x2 = float(np.max(core[:, 2]))
+        y2 = float(np.max(core[:, 3]))
+        trimmed = np.array([x1, y1, x2, y2], dtype=np.float32)
+
+        return trimmed
+
     def _color_for_class(self, c):
         rng = np.random.RandomState(c * 9973 + 12345)
-        return tuple(int(x) for x in rng.randint(0, 256, size=3))  # BGR
+        return tuple(int(x) for x in rng.randint(0, 256, size=3))
 
     def _draw_boxes_with_custom_legend(
             self,
@@ -313,7 +350,31 @@ class YoloWrapper:
 
         return out
 
-
+    def _refine_crowd_with_p2p(self, frame_bgr, boxes, classes, class_names):
+        """
+        For every box whose class name is 'pedestrian', run P2PNet in that region,
+        draw red head dots, and put a small 'P2P:<count>' tag near the box.
+        Returns the modified frame and a list of per-box counts (0 for non-pedestrian).
+        """
+        out = frame_bgr
+        per_box_counts = []
+        for (x1, y1, x2, y2), c in zip(boxes, classes):
+            c = int(c)
+            label = class_names.get(c, "")
+            if label == "pedestrian":
+                _ , cnt, pts_abs = self.crowd_estimator.infer_on_bbox(out, (x1, y1, x2, y2))
+                # draw head dots
+                for (hx, hy) in pts_abs:
+                    cv2.circle(out, (int(hx), int(hy)), 2, (0, 0, 255), -1)
+                # annotate count near the top-left of the box
+                # tag = f"P2P:{cnt}"
+                # (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                # cv2.rectangle(out, (int(x1), int(y1) - th - 6), (int(x1) + tw + 6, int(y1)), (0, 0, 0), -1)
+                # cv2.putText(out, tag, (int(x1) + 3, int(y1) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                # per_box_counts.append(cnt)
+            else:
+                per_box_counts.append(0)
+        return out, per_box_counts
 
 
 
