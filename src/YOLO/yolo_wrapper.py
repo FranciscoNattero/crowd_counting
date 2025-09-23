@@ -8,6 +8,7 @@ import torch
 from torchvision.ops import box_iou
 from P2PNet.P2PNet_wrapper import P2PNetWrapper
 from P2PNet.P2PNet_config import P2PNetConfig
+from sklearn.cluster import DBSCAN
 
 class YoloWrapper:
     def __init__(self, config):
@@ -81,8 +82,7 @@ class YoloWrapper:
             track = self.tracker.update_with_detections(detections)
 
             if track.xyxy.shape[0] == 0:
-                frame_bgr = self._plot_yolo_boxes(res, merged_xyxy, merged_cls, merged_conf, merged_amount, res.names)
-                frame_bgr, _counts = self._refine_crowd_with_p2p(frame_bgr, merged_xyxy, merged_cls, res.names)
+                frame_bgr = self._plot_yolo_boxes(frame_bgr, merged_xyxy, merged_cls, merged_conf, merged_amount, [], res.names)
                 self.prev_state.clear()
 
             else:
@@ -90,10 +90,9 @@ class YoloWrapper:
                 boxes = track.xyxy.astype(np.float32)
                 classes = track.class_id.astype(int)
                 confs   = track.confidence.astype(np.float32)
-                tracked_amount = track.data.get(
-                        "merge_box_amount",
-                        np.ones(len(boxes), dtype=np.int32)
-                    )
+                tracked_amount = np.zeros(len(ids), dtype=np.float32)
+                points_list = []
+                absolute_points = []
 
                 clamped = boxes.copy()
 
@@ -103,17 +102,25 @@ class YoloWrapper:
                 for i, tid in enumerate(ids):
                     if not pedestrian_mask[i]:
                         continue #solo promedio las merged boxes de pedestrians
-                    history = self.prev_state.setdefault(tid, {"boxes_queue": deque(maxlen=20)})
-                    clamped[i] = self._clamp_transition(history, boxes[i])
+                    history = self.prev_state.setdefault(tid, {"boxes_queue": deque(maxlen=20), "boxes_count_queue": deque(maxlen=40)})
                     history["boxes_queue"].append(boxes[i])
+                    clamped[i] = self._clamp_transition(history["boxes_queue"], boxes[i])
+                    _ , cnt, pts_abs = self.crowd_estimator.infer_on_bbox(frame_bgr, boxes[i])
+                    history["boxes_count_queue"].append(cnt)
+                    tracked_amount[i] = np.mean(history["boxes_count_queue"])
+                    if pts_abs:
+                        points_list.extend(pts_abs)
+
+                    absolute_points = (
+                        np.asarray(points_list, dtype=np.int32) if points_list else np.empty((0, 2), np.int32)
+                    )
+
 
                 active_ids = set(ids.tolist())
                 self.prev_state = {tid: hist for tid, hist in self.prev_state.items() if tid in active_ids}
 
-                frame_bgr, _counts = self._refine_crowd_with_p2p(frame_bgr, clamped, classes, res.names)
-
                 frame_bgr = self._plot_yolo_boxes(
-                        frame_bgr, clamped, classes, confs, tracked_amount, res.names
+                        frame_bgr, clamped, classes, confs, tracked_amount, absolute_points, res.names
                     )
 
             if writer is None:
@@ -134,38 +141,8 @@ class YoloWrapper:
             writer.release()
         return out_path, total_frames
     
-    def _draw_overlay(self, img_bgr, text, alpha=0.5, pad=12):
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-        x0, y0, x1, y1 = pad, pad, pad + tw + 2*pad, pad + th + 2*pad
-
-        overlay = img_bgr.copy()
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), (40, 40, 40), -1)
-        cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, img_bgr)
-
-        cv2.putText(img_bgr, text, (x0 + pad, y1 - pad),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        
-    def _count_people(self, classes, class_names):
-        # print(names)
-        return int(sum(1 for c in classes if class_names.get(int(c), "") in ["pedestrian", "people"]))
-    
-    def _plot_yolo_boxes(self, frame_bgr, xyxy, cls, conf, merge_box_amount, class_names):
-        return self._draw_boxes_with_custom_legend(frame_bgr, xyxy, cls, conf, class_names, merge_box_amount)
-
-    def _boxes_iou(self, a, b):
-        xa1, ya1, xa2, ya2 = a
-        xb1, yb1, xb2, yb2 = b
-        inter_x1 = max(xa1, xb1)
-        inter_y1 = max(ya1, yb1)
-        inter_x2 = min(xa2, xb2)
-        inter_y2 = min(ya2, yb2)
-        inter_w = max(0.0, inter_x2 - inter_x1)
-        inter_h = max(0.0, inter_y2 - inter_y1)
-        inter = inter_w * inter_h
-        area_a = max(0.0, (xa2 - xa1)) * max(0.0, (ya2 - ya1))
-        area_b = max(0.0, (xb2 - xb1)) * max(0.0, (yb2 - yb1))
-        union = area_a + area_b - inter
-        return inter / union if union > 0 else 0.0
+    def _plot_yolo_boxes(self, frame_bgr, xyxy, cls, conf, merge_box_amount, absolute_points, class_names):
+        return self._draw_boxes_with_custom_legend(frame_bgr, xyxy, cls, conf, class_names, absolute_points, merge_box_amount)
     
     def _to_cxcywh(self, b):
         x1,y1,x2,y2 = b; w=x2-x1; h=y2-y1
@@ -245,12 +222,6 @@ class YoloWrapper:
 
                 group_boxes = boxes_c[comp]
                 group_conf = conf_c[comp]
-                # merged_boxes.append([
-                #     float(group_boxes[:, 0].min()),
-                #     float(group_boxes[:, 1].min()),
-                #     float(group_boxes[:, 2].max()),
-                #     float(group_boxes[:, 3].max())
-                # ])
                 merged_box = self._merge_group_boxes(group_boxes)
                 merged_boxes.append(merged_box.tolist())
                 merged_classes.append(int(class_id))
@@ -296,85 +267,34 @@ class YoloWrapper:
             img_bgr,
             boxes, classes, confs,
             class_names,
+            absolute_points,
             merge_box_amount,
-            legend_order=None,
-            thickness=2,
-            font_scale=0.5
         ):
 
-        legend_title="Detections"
         out = img_bgr
 
-        for (x1, y1, x2, y2), c, cf, merge_amount in zip(boxes, classes, confs, merge_box_amount):
+        # proceso las bounding boxes con mayor merge amount al final asi quedan superpuestas a las demas
+        order = np.argsort(merge_box_amount, kind="stable")
+
+        for i in order:
+            x1, y1, x2, y2 = boxes[i]
+            c = int(classes[i])
+            cf = confs[i]
+            merge_amount = merge_box_amount[i]
             c = int(c)
             col = self._color_for_class(c)
-            cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)), col, thickness)
-            # label = f"{class_names[c]} {cf:.2f}"
-            if class_names[c] == "pedestrian":
-                label = f"Quiet crowd of {merge_amount}"
+            cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)), col, 2)
+            if class_names[c] == "pedestrian" and merge_amount > 1:
+                label = f"Quiet crowd of {int(merge_amount)}"
             else:
                 label = f"{class_names[c]}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(out, (int(x1), int(y1) - th - 6), (int(x1) + tw + 4, int(y1)), col, -1)
-            cv2.putText(out, label, (int(x1) + 2, int(y1) - 4), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255,255,255), 1, cv2.LINE_AA)
+            cv2.putText(out, label, (int(x1) + 2, int(y1) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
 
-        counts = Counter(classes.tolist())
-
-        pad = 8
-        line_h = 18
-        entries = legend_order if legend_order is not None else sorted(counts.keys())
-        legend_lines = []
-        for c in entries:
-            if c in counts:
-                legend_lines.append((c, f"{class_names[c]}: {counts[c]}"))
-
-        if legend_title or legend_lines:
-            max_text_w = 0
-            for txt in [legend_title] + [t for _, t in legend_lines]:
-                (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-                max_text_w = max(max_text_w, tw)
-            box_w = max_text_w + 3*pad + 16
-            box_h = pad + line_h + len(legend_lines)*line_h + pad
-
-            cv2.rectangle(out, (pad, pad), (pad + box_w, pad + box_h), (0,0,0), -1)
-            cv2.rectangle(out, (pad, pad), (pad + box_w, pad + box_h), (255,255,255), 1)
-
-            cv2.putText(out, legend_title, (pad + 8, pad + line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
-
-            y = pad + line_h*2
-            for c, txt in legend_lines:
-                col = self._color_for_class(int(c))
-                cv2.rectangle(out, (pad + 8, y - 12), (pad + 8 + 12, y - 12 + 12), col, -1)
-                cv2.putText(out, txt, (pad + 8 + 16 + 6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
-                y += line_h
+        for x, y in absolute_points:
+            cv2.circle(out, (int(x), int(y)), 2, (0, 0, 255), -1, lineType=cv2.LINE_AA)
 
         return out
-
-    def _refine_crowd_with_p2p(self, frame_bgr, boxes, classes, class_names):
-        """
-        For every box whose class name is 'pedestrian', run P2PNet in that region,
-        draw red head dots, and put a small 'P2P:<count>' tag near the box.
-        Returns the modified frame and a list of per-box counts (0 for non-pedestrian).
-        """
-        out = frame_bgr
-        per_box_counts = []
-        for (x1, y1, x2, y2), c in zip(boxes, classes):
-            c = int(c)
-            label = class_names.get(c, "")
-            if label == "pedestrian":
-                _ , cnt, pts_abs = self.crowd_estimator.infer_on_bbox(out, (x1, y1, x2, y2))
-                # draw head dots
-                for (hx, hy) in pts_abs:
-                    cv2.circle(out, (int(hx), int(hy)), 2, (0, 0, 255), -1)
-                # annotate count near the top-left of the box
-                # tag = f"P2P:{cnt}"
-                # (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                # cv2.rectangle(out, (int(x1), int(y1) - th - 6), (int(x1) + tw + 6, int(y1)), (0, 0, 0), -1)
-                # cv2.putText(out, tag, (int(x1) + 3, int(y1) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-                # per_box_counts.append(cnt)
-            else:
-                per_box_counts.append(0)
-        return out, per_box_counts
-
 
 

@@ -4,7 +4,7 @@ class YoloConfig:
     # model_path = "runs/detect/train4/weights/best.pt"
     conf = 0.1
     iou = 0.45
-    imgsz = 1280
+    imgsz = 1920
     device = 1
     classes = range(9),
     merge_iou_threshold = 0.2,
@@ -15,4 +15,6 @@ class YoloConfig:
     track_buffer = 5 # dejamos los tracks perdidos por esta cantidad de frames
     workers = 50
     vid_stride=1
+    cluster_k = 0.8 
+    cluster_min_samples = 1
     
