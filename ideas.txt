@@ -1,0 +1,6 @@
+
+
+cuando se hace el extend en merge classes (if de pedestriann) ver si ese if se puede hacer afuera y pasarle a la funcion un cls ya filtrado por clases}
+
+Cambiar la anotacion del cuadradito para que tenga la cantidad de pedestrians (se puede hacer con la funcion de count)
+

@@ -1,0 +1,20 @@
+RT-DETR: yolo train model=rtdetr-l.pt data=VisDrone.yaml epochs=1000 imgsz=1920 device=1 batch=4
+YOLO: yolo train model=yolo11l.pt data=VisDrone.yaml epochs=10000 imgsz=1024 device=1
+
+LCDnet:
+python src/LCDnet.py \
+  --data_root datasets/DroneRGBT \
+  --split Train \
+  --val_split Test \
+  --modality rgbt \
+  --rgb_dir RGB \
+  --t_dir Infrared \
+  --ann_dir GT_ \
+  --t_suffix R \
+  --ann_suffix R \
+  --lr 1e-4 \
+  --device cuda:1 \
+  --epochs 1000 \
+  --use_curriculum by_count \
+  
+

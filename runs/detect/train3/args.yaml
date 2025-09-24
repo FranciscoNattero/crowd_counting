@@ -1,12 +1,12 @@
 task: detect
 mode: train
-model: yolo11x.pt
+model: yolo11l.pt
 data: VisDrone.yaml
-epochs: 500
+epochs: 10000
 time: null
 patience: 100
 batch: 16
-imgsz: 1280
+imgsz: 1024
 save: true
 save_period: -1
 cache: false

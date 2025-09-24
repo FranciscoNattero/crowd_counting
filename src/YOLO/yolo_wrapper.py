@@ -1,7 +1,7 @@
 from ultralytics import YOLO, RTDETR
 import cv2
 import numpy as np
-from collections import Counter, deque
+from collections import deque, defaultdict
 import supervision as sv
 import os
 import torch
@@ -196,12 +196,11 @@ class YoloWrapper:
 
             if n == 0:
                 continue
-
+                
             expand_pad = torch.tensor([-100, -100, 100, 100], dtype=torch.float32)
             boxes_tensor = torch.from_numpy(boxes_c)
             adjacency = (box_iou(boxes_tensor + expand_pad, boxes_tensor + expand_pad)
                          >= self.config.merge_iou_threshold[0]).numpy()
-
 
             #Nodo por nodo recorro sus vecinos y los mergeo con el nodo actual. Hago bfs
             visited = np.zeros(n, dtype=bool)

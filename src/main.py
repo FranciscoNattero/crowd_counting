@@ -2,6 +2,7 @@ from ultralytics import YOLO
 from YOLO.yolo_wrapper import YoloWrapper
 from YOLO.yolo_config import YoloConfig
 
+
 def main():
     print()
     model_wrapper = YoloWrapper(YoloConfig())

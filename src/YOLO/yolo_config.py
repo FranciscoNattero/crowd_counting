@@ -17,4 +17,5 @@ class YoloConfig:
     vid_stride=1
     cluster_k = 0.8 
     cluster_min_samples = 1
+    merge_proximity_px = [80.0]
     
